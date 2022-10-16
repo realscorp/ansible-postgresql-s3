@@ -1,0 +1,99 @@
+---
+# Для удобства генерируем имя файла бэкапа в виде отдельной переменной
+- name: Generate file name with DB name, date and time encoded, with .gpg extension in case of non-empty Passphrase
+  ansible.builtin.set_fact:
+    filename: "{{ item }}_{{ '%Y-%m-%d_%H-%M-%S' | strftime }}{{ (pgbu_gpg_passphrase | d() != '') | ternary ('.dump.gpg','.dump') }}"
+
+# Для удобства создаём ту часть команды, где будет шифроваться поток бэкапа, как отдельную переменную. Если пароль не задан, переменная будет пустой.
+- name: Set encryption options in case Passphrase is not empty
+  ansible.builtin.set_fact:
+    encr_options: "{{ ((pgbu_gpg_passphrase | d()) != '') | ternary (('| gpg --batch -c --passphrase ' + (pgbu_gpg_passphrase | d())),'') }}"
+
+- name: Create encrypted compressed backup file right into S3 bucket via s3cmd using pipes
+  vars:
+    ansible_become_user: postgres # запускаем таску от пользователя, под которым работает СУБД
+    ansible_shell_allow_world_readable_temp: true # Требуется, чтобы можно было запускать таску асинхронно от имени непривилегированного пользователя
+  # Используем модуль shell, так как модуль command не поддерживает pipelining, а мы хотим отправлять бэкап из pg_dump сразу в s3
+  # Перед выполнением pg_dump включаем pipefail https://blog.christophersmart.com/2019/09/28/using-pipefail-with-shell-module-in-ansible/
+  shell:
+    "set -o pipefail && pg_dump -FC {{ item }} -Z{{ pgbu_compression_level }}
+    {{ encr_options }} |
+    s3cmd -c /etc/.s3cfg put - s3://{{ pgbu_s3_bucket_name }}/{{ pgbu_s3_path }}/daily/{{ filename }}"
+  args:
+    executable: /usr/bin/bash # принудительно указываем использование bash, так как sh не знает про pipefail
+  async: 43200 # Запускаем задачу асинхронно, потому что бэкап большой базы может быть длительным
+  poll: 60 # каждые 60 секунд проверяем статус асинхронно запущенной задачи
+
+# Получаем список ключей, содержащий именая существующих ежедневных бэкапов
+- name: Get daily backups list
+  amazon.aws.aws_s3:
+    aws_access_key: "{{ pgbu_s3_access_key }}"
+    aws_secret_key: "{{ pgbu_s3_secret_key }}"
+    bucket: "{{ pgbu_s3_bucket_name }}"
+    s3_url: https://ib.bizmrg.com/
+    mode: list
+    prefix: "{{ pgbu_s3_path }}/daily/{{ item }}"
+  register: s3_content
+
+# Удаляем старые бэкапы
+- name: Recycle daily backups to a given keep files number
+  amazon.aws.aws_s3:
+    aws_access_key: "{{ pgbu_s3_access_key }}"
+    aws_secret_key: "{{ pgbu_s3_secret_key }}"
+    bucket: "{{ pgbu_s3_bucket_name }}"
+    s3_url: https://ib.bizmrg.com/
+    mode: delobj
+    object: "{{ s3obj }}"
+  # Берём список ключей S3, сортируем по имени, так как в имени у нас уже задано время создания, и удаляем первые N
+  with_items: "{{ (s3_content.s3_keys | sort(reverse=true) | list)[pgbu_files_daily_to_keep:] }}"
+  loop_control:
+    loop_var: s3obj # Задаём имя переменной цикла вместо стандартного item, чтобы не пересекаться с внешним циклом
+
+# Обрабатываем логику месячных бэкапов, если для них задана глубина хранения > 0
+- block:
+    # Для ежемесячных бэкапов в имени оставляем только название БД и год-месяц
+    - name: Generate file name of monthly backup
+      ansible.builtin.set_fact:
+        filename_monthly: "{{ item }}_{{ '%Y-%m' | strftime }}{{ (pgbu_gpg_passphrase | d() != '') | ternary ('.dump.gpg','.dump') }}"
+
+    - name: Check if monthly backup for current month exist already
+      amazon.aws.aws_s3:
+        aws_access_key: "{{ pgbu_s3_access_key }}"
+        aws_secret_key: "{{ pgbu_s3_secret_key }}"
+        bucket: "{{ pgbu_s3_bucket_name }}"
+        s3_url: https://ib.bizmrg.com/
+        mode: list
+        prefix: "{{ pgbu_s3_path }}/monthly/{{ item }}"
+      register: s3_content_monthly
+
+    # Если не в S3 каталоге не найдено объектов с именем бэкапа для текущего месяца, то копируем свежесозданный дневной в месячный
+    # Так как мы используем API S3, копирование происходит на стороне платформы, мгновенно
+    - name: Copy fresh daily backup as monthly if there is no backup for current month
+      vars:
+        ansible_ssh_pipelining: true
+        ansible_become_user: postgres
+      command:
+        argv:
+          - s3cmd
+          - --acl-private # Оставить private права на объект, без этой опции s3cmd выкидывает 403
+          - -c
+          - /etc/.s3cfg
+          - cp
+          - s3://{{ pgbu_s3_bucket_name }}/{{ pgbu_s3_path }}/daily/{{ filename }}
+          - s3://{{ pgbu_s3_bucket_name }}/{{ pgbu_s3_path }}/monthly/{{ filename_monthly }}
+      when: s3_content_monthly.s3_keys | map('basename') | select('match', filename_monthly) | length == 0
+
+    # Удаляем старые бэкапы
+    - name: Recycle monthly backups
+      amazon.aws.aws_s3:
+        aws_access_key: "{{ pgbu_s3_access_key }}"
+        aws_secret_key: "{{ pgbu_s3_secret_key }}"
+        bucket: "{{ pgbu_s3_bucket_name }}"
+        s3_url: https://ib.bizmrg.com/
+        mode: delobj
+        object: "{{ s3obj }}"
+      with_items: "{{ (s3_content_monthly.s3_keys | sort(reverse=true) | list)[pgbu_files_monthly_to_keep:] }}"
+      loop_control:
+        loop_var: s3obj
+
+  when: pgbu_files_monthly_to_keep | d(0) > 0

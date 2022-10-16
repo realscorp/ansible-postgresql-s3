@@ -1,0 +1,58 @@
+---
+- name: Backup PostgreSQL to S3
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Install Pip module
+      ansible.builtin.apt:
+        name: python3-pip=20.0*
+        state: present
+
+    - name: Install Python packages
+      ansible.builtin.pip:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - botocore>1.27.0,<1.28.0 # для работы модуля aws
+        - boto3>1.24.0,<1.25.0 # для работы модуля aws
+        - s3cmd==2.2.0 # для работы s3cmd
+
+    - name: Create password file for s3cmd
+      ansible.builtin.template:
+        dest: /etc/.s3cfg
+        src: "templates/.s3cfg.j2"
+        owner: postgres
+        group: postgres
+        mode: "0600"
+
+    - name: Get list of existing databases
+      vars:
+        ansible_ssh_pipelining: true
+        ansible_become_user: postgres # имперсонируемся в пользователя, от имени которого работает СУБД, чтобы выполнять действия без пароля
+      community.postgresql.postgresql_info:
+        db: postgres
+        filter: databases
+      register: db_list_existing
+
+    # Формируем список БД, сверяя каждую существующую БД с тем списком, что у нас в хостовых переменных
+    - name: Filter database list
+      set_fact:
+        db_list_to_backup: "{{ (db_list_to_backup | d([])) + (db_list_existing.databases | list | select('match',item)) }}"
+      with_items: "{{ pgbu_db_list }}"
+
+    # Создаём список баз и их размеров для упрощения отладки в случае чего
+    - name: Let's create nice and sleek list of databases with it's sizes
+      set_fact:
+        db_list_with_sizes: "{{ db_list_with_sizes | d([]) +
+          [('Database: ' + item + ', size: ' + db_list_existing.databases[item].size | int | human_readable )] }}"
+      with_items: "{{ db_list_to_backup }}"
+
+    - name: That's list of databases we're going to backup this time
+      debug:
+        msg: "{{ db_list_with_sizes }}"
+
+    # Для каждой базы в списке для бэкапа запускаем файл тасок со всеми необходимыми действиями
+    - name: Include tasks
+      ansible.builtin.include_tasks:
+        file: tasks/backup_routine.yml
+      with_items: "{{ db_list_to_backup }}"

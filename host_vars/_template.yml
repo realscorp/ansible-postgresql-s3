@@ -1,0 +1,9 @@
+pgbu_s3_path: postgresql/servername
+pgbu_s3_access_key: '******************'
+pgbu_s3_secret_key: '************************'
+pgbu_gpg_passphrase: '***********************'
+pgbu_db_list:
+  - someprefix*
+  - dbname
+pgbu_files_daily_to_keep: 14
+pgbu_files_monthly_to_keep: 2
